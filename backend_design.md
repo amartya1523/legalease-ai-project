@@ -150,8 +150,8 @@ Based on the analysis of the frontend application, the backend will need to supp
     "clientName": "Globex Inc.",
     "serviceDescription": "Software development services",
     "serviceFee": "$5000",
-    "startDate": "2025-09-01",
-    "endDate": "2025-12-31"
+    "start_date": "2025-09-01",
+    "end_date": "2025-12-31"
   }
 }
 ```

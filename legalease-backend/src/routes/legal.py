@@ -1,4 +1,4 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, send_file
 from flask_cors import cross_origin
 import google.generativeai as genai
 import os
@@ -7,6 +7,11 @@ import base64
 import tempfile
 from fpdf import FPDF
 import json
+import io
+
+from PyPDF2 import PdfReader
+from docx import Document
+
 from src.templates.agreement_templates import get_template_by_type, format_template
 
 legal_bp = Blueprint('legal', __name__)
@@ -19,7 +24,32 @@ model = genai.GenerativeModel('gemini-1.5-flash')
 documents = {}
 chat_histories = {}
 
-@legal_bp.route('/upload', methods=['POST'])
+# ------------------- Helper functions -------------------
+
+def extract_pdf_text(file_bytes):
+    reader = PdfReader(io.BytesIO(file_bytes))
+    text = ""
+    for page in reader.pages:
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text + "\n"
+    return text
+
+def extract_docx_text(file_bytes):
+    doc = Document(io.BytesIO(file_bytes))
+    text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+    return text
+
+def safe_format(template_str, data):
+    """Safely format a string using keys in data. Missing keys replaced with placeholder."""
+    class SafeDict(dict):
+        def __missing__(self, key):
+            return f"{{{key}}}"
+    return template_str.format_map(SafeDict(data))
+
+# ------------------- Upload Route -------------------
+
+@legal_bp.route('/upload', methods=['POST'], endpoint='upload_document')
 @cross_origin()
 def upload_document():
     try:
@@ -31,53 +61,45 @@ def upload_document():
         if not file_content or not file_name:
             return jsonify({'error': 'Missing file content or name'}), 400
         
-        # Generate unique document ID
         document_id = str(uuid.uuid4())
         
-        # Decode base64 content
         try:
             decoded_content = base64.b64decode(file_content)
-        except Exception as e:
+        except Exception:
             return jsonify({'error': 'Invalid base64 content'}), 400
         
-        # For text files, we can directly analyze the content
-        # For PDFs and other formats, we'll need to extract text first
         if file_type == 'text/plain':
             text_content = decoded_content.decode('utf-8')
+        elif file_type == 'application/pdf':
+            text_content = extract_pdf_text(decoded_content)
+        elif file_type in ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/msword']:
+            text_content = extract_docx_text(decoded_content)
         else:
-            # For now, we'll handle PDFs and other formats as text
-            # In a production environment, you'd use proper PDF parsing libraries
             text_content = "Document uploaded successfully. Content analysis available."
         
-        # Analyze document with Gemini
         analysis_prompt = f"""
         Analyze this legal document and provide:
         1. Document type identification
         2. Key clauses and terms
         3. Potential risks or issues
         4. Summary of main points
-        
+
         Document content:
-        {text_content[:2000]}  # Limit content to avoid token limits
-        
-        Provide a conversational response as if you're a legal AI assistant.
+        {text_content[:2000]}
         """
         
         try:
             response = model.generate_content(analysis_prompt)
             initial_message = response.text
-        except Exception as e:
-            initial_message = f"I've received your document '{file_name}'. This appears to be a legal document. What would you like to know about it? I can help explain clauses, identify potential issues, or answer specific questions."
+        except Exception:
+            initial_message = f"I've received your document '{file_name}'. This appears to be a legal document. How can I assist you?"
         
-        # Store document information
         documents[document_id] = {
             'file_name': file_name,
             'file_type': file_type,
             'content': text_content,
             'analysis': initial_message
         }
-        
-        # Initialize chat history for this document
         chat_histories[document_id] = []
         
         return jsonify({
@@ -85,11 +107,12 @@ def upload_document():
             'status': 'ready',
             'initial_bot_message': initial_message
         })
-        
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@legal_bp.route('/chat/upload', methods=['POST'])
+# ------------------- Chat Routes -------------------
+
+@legal_bp.route('/chat/upload', methods=['POST'], endpoint='chat_upload_document')
 @cross_origin()
 def chat_upload():
     try:
@@ -103,43 +126,32 @@ def chat_upload():
         if document_id not in documents:
             return jsonify({'error': 'Document not found'}), 404
         
-        # Get document content and chat history
         document = documents[document_id]
         chat_history = chat_histories.get(document_id, [])
         
-        # Build context for Gemini
         context = f"""
         Document: {document['file_name']}
         Content: {document['content'][:1500]}
         
         Previous conversation:
         """
-        
-        for chat in chat_history[-5:]:  # Last 5 messages for context
+        for chat in chat_history[-5:]:
             context += f"User: {chat['user']}\nAssistant: {chat['bot']}\n"
         
-        context += f"\nUser: {message}\n\nPlease provide a helpful response based on the document content and conversation history."
+        context += f"\nUser: {message}\n\nPlease provide a helpful response based on the document content."
         
         try:
             response = model.generate_content(context)
             bot_response = response.text
-        except Exception as e:
-            bot_response = "I understand your question about the document. Based on my analysis, I can help you with legal document interpretation. Could you please rephrase your question?"
+        except Exception:
+            bot_response = "I can help with document interpretation. Please clarify your question."
         
-        # Store chat history
-        chat_histories[document_id].append({
-            'user': message,
-            'bot': bot_response
-        })
-        
-        return jsonify({
-            'bot_response': bot_response
-        })
-        
+        chat_histories[document_id].append({'user': message, 'bot': bot_response})
+        return jsonify({'bot_response': bot_response})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@legal_bp.route('/chat/general', methods=['POST'])
+@legal_bp.route('/chat/general', methods=['POST'], endpoint='chat_general_document')
 @cross_origin()
 def chat_general():
     try:
@@ -149,31 +161,25 @@ def chat_general():
         if not message:
             return jsonify({'error': 'Missing message'}), 400
         
-        # General legal chat prompt
         prompt = f"""
-        You are a legal AI assistant. Please provide a helpful, informative response to this legal question:
-        
+        You are a legal AI assistant. Provide an informative response to this legal question:
         {message}
-        
-        Provide accurate legal information while noting that this is general information and not legal advice.
         """
-        
         try:
             response = model.generate_content(prompt)
             bot_response = response.text
-        except Exception as e:
-            bot_response = "I'm here to help with legal questions. Could you please provide more details about what you'd like to know?"
+        except Exception:
+            bot_response = "Please provide more details so I can help with your legal question."
         
-        return jsonify({
-            'bot_response': bot_response
-        })
-        
+        return jsonify({'bot_response': bot_response})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@legal_bp.route('/generate-agreement', methods=['POST'])
+# ------------------- Agreement Generation -------------------
+
+@legal_bp.route('/generate-agreement', methods=['POST'], endpoint='generate_agreement_unique')
 @cross_origin()
-def generate_agreement():
+def generate_agreement_route():
     try:
         data = request.json
         agreement_type = data.get('agreement_type')
@@ -182,102 +188,82 @@ def generate_agreement():
         if not agreement_type or not form_data:
             return jsonify({'error': 'Missing agreement_type or form_data'}), 400
         
-        # Get predefined template
         template = get_template_by_type(agreement_type)
-        formatted_template = format_template(template, form_data)
-        
-        # Enhance content with Gemini AI
-        enhanced_content = enhance_agreement_with_ai(formatted_template, agreement_type, form_data)
-        
-        # Generate PDF with enhanced content
+
+        for section in template['sections']:
+            section['title'] = safe_format(section['title'], form_data)
+            section['content'] = safe_format(section['content'], form_data)
+        template['signature_block'] = safe_format(template['signature_block'], form_data)
+
+        enhanced_content = enhance_agreement_with_ai(template, agreement_type, form_data)
         pdf_path = generate_enhanced_pdf(enhanced_content, agreement_type, form_data)
-        
-        return jsonify({
-            'pdf_url': f'/api/download/{os.path.basename(pdf_path)}'
-        })
-        
+
+        return jsonify({'pdf_url': f'/download/{os.path.basename(pdf_path)}'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# ------------------- Helper Functions for Agreement -------------------
+
 def enhance_agreement_with_ai(template, agreement_type, form_data):
-    """Use Gemini AI to enhance the predefined template with additional clauses"""
-    
     prompt = f"""
-    Review and enhance this {agreement_type} agreement template. Add any missing important clauses 
-    and ensure legal completeness while maintaining the existing structure.
-    
-    Current template:
-    {template['title']}
-    
+    Review and enhance this {agreement_type} agreement template. Add missing important clauses 
+    while keeping structure intact.
+
+    Current template: {template['title']}
     Sections:
     """
-    
     for section in template['sections']:
         prompt += f"\n{section['title']}\n{section['content']}\n"
-    
     prompt += f"\nSignature Block:\n{template['signature_block']}"
-    
-    prompt += f"""
-    
-    Form Data: {json.dumps(form_data, indent=2)}
-    
-    Please provide suggestions for additional clauses or improvements while keeping the existing structure.
-    Focus on legal accuracy and completeness for a {agreement_type} agreement.
-    """
-    
+    prompt += f"\nForm Data: {json.dumps(form_data, indent=2)}"
+
     try:
         response = model.generate_content(prompt)
         ai_suggestions = response.text
-        
-        # For now, return the original template with AI suggestions as a comment
-        # In a production system, you might parse and integrate the AI suggestions
         enhanced_template = template.copy()
         enhanced_template['ai_suggestions'] = ai_suggestions
         return enhanced_template
-        
-    except Exception as e:
-        # If AI enhancement fails, return the original template
+    except Exception:
         return template
 
 def generate_enhanced_pdf(template, agreement_type, form_data):
-    """Generate PDF from enhanced template with professional formatting"""
-    
     class EnhancedPDF(FPDF):
         def __init__(self):
             super().__init__()
             self.set_auto_page_break(auto=True, margin=15)
+            font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+            if os.path.exists(font_path):
+                self.add_font("DejaVu", "", font_path, uni=True)
+                self.add_font("DejaVu", "B", font_path, uni=True)
+                self.add_font("DejaVu", "I", font_path, uni=True)
+                self.set_font("DejaVu", "", 11)
+            else:
+                self.set_font("Arial", "", 11)
         
         def header(self):
-            self.set_font('Arial', 'B', 20)
+            self.set_font('DejaVu', 'B', 20)
             self.cell(0, 15, template['title'], 0, 1, 'C')
             self.ln(5)
-            # Add a line under the header
             self.set_draw_color(128, 128, 128)
             self.line(20, self.get_y(), 190, self.get_y())
             self.ln(10)
         
         def footer(self):
             self.set_y(-15)
-            self.set_font('Arial', 'I', 8)
+            self.set_font('DejaVu', 'I', 8)
             self.set_text_color(128, 128, 128)
             self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
         
         def add_section(self, title, content):
-            # Section title
-            self.set_font('Arial', 'B', 14)
+            self.set_font('DejaVu', 'B', 14)
             self.set_text_color(0, 0, 0)
             self.cell(0, 10, title, 0, 1, 'L')
             self.ln(2)
-            
-            # Section content
-            self.set_font('Arial', '', 11)
+            self.set_font('DejaVu', '', 11)
             self.set_text_color(40, 40, 40)
-            
-            # Split content into paragraphs
             paragraphs = content.split('\n\n')
             for paragraph in paragraphs:
                 if paragraph.strip():
-                    # Handle long lines by wrapping text
                     lines = self.wrap_text(paragraph.strip(), 170)
                     for line in lines:
                         self.cell(0, 6, line, 0, 1, 'L')
@@ -285,11 +271,9 @@ def generate_enhanced_pdf(template, agreement_type, form_data):
             self.ln(5)
         
         def wrap_text(self, text, max_width):
-            """Wrap text to fit within specified width"""
             words = text.split(' ')
             lines = []
             current_line = ''
-            
             for word in words:
                 test_line = current_line + (' ' if current_line else '') + word
                 if self.get_string_width(test_line) <= max_width:
@@ -298,39 +282,31 @@ def generate_enhanced_pdf(template, agreement_type, form_data):
                     if current_line:
                         lines.append(current_line)
                     current_line = word
-            
             if current_line:
                 lines.append(current_line)
-            
             return lines
     
     pdf = EnhancedPDF()
     pdf.add_page()
-    
-    # Add all sections
     for section in template['sections']:
-        pdf.add_section(section['title'], section['content'])
+        filled_title = section['title'].format(**form_data)
+        filled_content = section['content'].format(**form_data)
+        pdf.add_section(filled_title, filled_content)
     
-    # Add signature block
     pdf.ln(10)
-    pdf.set_font('Arial', 'B', 12)
+    pdf.set_font('DejaVu', 'B', 12)
     pdf.cell(0, 10, 'SIGNATURES', 0, 1, 'L')
     pdf.ln(5)
-    
-    pdf.set_font('Arial', '', 11)
-    signature_lines = template['signature_block'].split('\n')
+    pdf.set_font('DejaVu', '', 11)
+    signature_lines = template['signature_block'].format(**form_data).split('\n')
     for line in signature_lines:
         if line.strip():
             pdf.cell(0, 6, line, 0, 1, 'L')
     
-    # Add AI suggestions as an appendix if available
     if 'ai_suggestions' in template:
         pdf.add_page()
-        pdf.add_section('AI LEGAL REVIEW SUGGESTIONS', 
-                       "The following suggestions were generated by AI for your consideration:\n\n" + 
-                       template['ai_suggestions'])
+        pdf.add_section('AI LEGAL REVIEW SUGGESTIONS', "Suggestions generated by AI:\n\n" + template['ai_suggestions'])
     
-    # Save PDF to temporary file
     temp_dir = tempfile.gettempdir()
     pdf_filename = f"{agreement_type}_{uuid.uuid4().hex[:8]}.pdf"
     pdf_path = os.path.join(temp_dir, pdf_filename)
@@ -338,20 +314,17 @@ def generate_enhanced_pdf(template, agreement_type, form_data):
     
     return pdf_path
 
-@legal_bp.route('/download/<filename>')
+# ------------------- Download Route -------------------
+
+@legal_bp.route('/download/<filename>', endpoint='download_file')
 @cross_origin()
 def download_file(filename):
-    """Serve generated PDF files"""
     try:
         temp_dir = tempfile.gettempdir()
         file_path = os.path.join(temp_dir, filename)
-        
         if os.path.exists(file_path):
-            from flask import send_file
             return send_file(file_path, as_attachment=True, download_name=filename)
         else:
             return jsonify({'error': 'File not found'}), 404
-            
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-

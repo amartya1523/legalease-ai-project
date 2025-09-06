@@ -283,8 +283,8 @@ def format_template(template, form_data):
         'governing_state': '[State/Province]',
         'service_category': 'professional services',
         'security_deposit': '[Security Deposit Amount]',
-        'start_date': form_data.get('startDate', '[Start Date]'),
-        'end_date': form_data.get('endDate', '[End Date]')
+        'start_date': form_data.get('start_date', '[Start Date]'),
+        'end_date': form_data.get('end_date', '[End Date]')
     }
     
     # Merge form_data with defaults

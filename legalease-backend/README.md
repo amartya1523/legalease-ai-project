@@ -114,8 +114,8 @@ curl -X POST http://localhost:5000/api/generate-agreement \
       "clientName": "Client Inc",
       "serviceDescription": "Web development services",
       "serviceFee": "$5000",
-      "startDate": "2025-09-01",
-      "endDate": "2025-12-31"
+      "start_date": "2025-09-01",
+      "end_date": "2025-12-31"
     }
   }'
 ```
